@@ -13,11 +13,11 @@ const config = {
   options: {
     encrypt: true,
     trustServerCertificate: false,
-    connectTimeout: 5000,
-    requestTimeout: 10000,
+    connectTimeout: 15000,
+    requestTimeout: 120000, // 2 min — needed for LTS aggregation MERGE queries
   },
   pool: {
-    max: 10,
+    max: 5,  // stay well under the DB's 30-connection limit
     min: 0,
     idleTimeoutMillis: 30000,
   },
