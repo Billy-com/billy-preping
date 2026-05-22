@@ -11,3 +11,5 @@ require('./functions/admin/pipeline');
 require('./functions/postback');
 require('./functions/sms');
 require('./functions/sms-batch');
+require('./functions/admin/lts-aggregation');
+require('./functions/admin/lts-api');

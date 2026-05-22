@@ -54,10 +54,12 @@ async function run() {
     console.log(`  Running: ${file}`);
     const raw = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
 
-    // Remove comment lines, split on semicolons
+    // Remove comment lines, split on GO batch separators then semicolons
     const stripped = raw.replace(/--[^\n]*/g, '');
+    // Split on GO (T-SQL batch separator) first, then on semicolons within each batch
     const statements = stripped
-      .split(';')
+      .split(/\bGO\b/i)
+      .flatMap(batch => batch.split(';'))
       .map(s => s.trim())
       .filter(s => s.length > 0);
 
