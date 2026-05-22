@@ -59,6 +59,66 @@ app.http('ltsRunManual', {
   },
 });
 
+// ── DB raw-payload trim — POST /mgmt/db/trim ─────────────────────────────────
+// NULLs out raw_payload on inbound_pings and raw_response on ringba_responses
+// for rows older than keep_days (default 30). Runs in batches to avoid locking.
+// Safe: all structured columns (phone, zip, bid_amount, etc.) are preserved.
+app.http('dbTrim', {
+  methods: ['POST'],
+  route: 'mgmt/db/trim',
+  authLevel: 'anonymous',
+  handler: async (req) => {
+    const authError = requireAdminKey(req);
+    if (authError) return authError;
+
+    let body = {};
+    try { body = await req.json(); } catch {}
+    const keepDays  = parseInt(body.keep_days  ?? 30,   10);
+    const batchSize = parseInt(body.batch_size ?? 2000,  10);
+
+    const pool = await getPool();
+    const summary = { inbound_pings: 0, ringba_responses: 0 };
+
+    // Trim inbound_pings.raw_payload
+    let deleted = 1;
+    while (deleted > 0) {
+      const r = await pool.request()
+        .input('n',    sql.Int, batchSize)
+        .input('days', sql.Int, keepDays)
+        .query(`
+          UPDATE TOP(@n) inbound_pings
+          SET raw_payload = NULL
+          WHERE raw_payload IS NOT NULL
+            AND created_at < DATEADD(day, -@days, SYSDATETIMEOFFSET())
+        `);
+      deleted = r.rowsAffected[0];
+      summary.inbound_pings += deleted;
+    }
+
+    // Trim ringba_responses.raw_response
+    deleted = 1;
+    while (deleted > 0) {
+      const r = await pool.request()
+        .input('n',    sql.Int, batchSize)
+        .input('days', sql.Int, keepDays)
+        .query(`
+          UPDATE TOP(@n) ringba_responses
+          SET raw_response = NULL
+          WHERE raw_response IS NOT NULL
+            AND created_at < DATEADD(day, -@days, SYSDATETIMEOFFSET())
+        `);
+      deleted = r.rowsAffected[0];
+      summary.ringba_responses += deleted;
+    }
+
+    return {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ok: true, keep_days: keepDays, nulled: summary }),
+    };
+  },
+});
+
 // ── One-time catchup migration — POST /mgmt/lts/migrate ──────────────────────
 // Runs 010_catchup.sql statements through the live pool.
 // Can be called repeatedly — all statements are idempotent.
