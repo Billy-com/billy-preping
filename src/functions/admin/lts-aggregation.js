@@ -55,6 +55,139 @@ app.http('ltsRunManual', {
   },
 });
 
+// ── One-time catchup migration — POST /mgmt/lts/migrate ──────────────────────
+// Runs 010_catchup.sql statements through the live pool.
+// Can be called repeatedly — all statements are idempotent.
+app.http('ltsMigrate', {
+  methods: ['POST'],
+  route: 'mgmt/lts/migrate',
+  authLevel: 'anonymous',
+  handler: async (req) => {
+    const authError = requireAdminKey(req);
+    if (authError) return authError;
+
+    const pool = await getPool();
+    const results = [];
+
+    // Inline the critical catchup statements — all idempotent IF NOT EXISTS guards
+    const statements = [
+      // Add missing columns to ringba_responses
+      `IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='ringba_responses' AND COLUMN_NAME='ringba_status')
+         ALTER TABLE ringba_responses ADD ringba_status NVARCHAR(20) NULL`,
+      `IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='ringba_responses' AND COLUMN_NAME='ringba_status_code')
+         ALTER TABLE ringba_responses ADD ringba_status_code INT NULL`,
+      `IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='ringba_responses' AND COLUMN_NAME='outbound_payload')
+         ALTER TABLE ringba_responses ADD outbound_payload NVARCHAR(MAX) NULL`,
+      // phone_categories
+      `IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='phone_categories')
+       CREATE TABLE phone_categories (
+         id           UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID(),
+         phone        NVARCHAR(20)     NOT NULL,
+         category_key NVARCHAR(255)    NOT NULL,
+         source       NVARCHAR(50)     NULL,
+         valid_until  DATETIMEOFFSET   NULL,
+         created_at   DATETIMEOFFSET   NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+         CONSTRAINT PK_phone_categories PRIMARY KEY (id),
+         CONSTRAINT UQ_phone_categories UNIQUE (phone, category_key)
+       )`,
+      `IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_phone_categories_phone')
+         CREATE INDEX IX_phone_categories_phone ON phone_categories (phone)`,
+      // sequence_triggers
+      `IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='sequence_triggers')
+       CREATE TABLE sequence_triggers (
+         id                        UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID(),
+         ping_id                   UNIQUEIDENTIFIER NULL,
+         mts_id                    UNIQUEIDENTIFIER NULL,
+         phone                     NVARCHAR(20)     NULL,
+         vertical                  NVARCHAR(50)     NULL,
+         campaign                  NVARCHAR(255)    NULL,
+         flow                      NVARCHAR(20)     NOT NULL,
+         action                    NVARCHAR(50)     NOT NULL,
+         category_matched          NVARCHAR(255)    NULL,
+         was_enrichment_required   BIT              NULL,
+         was_contacted_30d         BIT              NULL,
+         was_in_category           BIT              NULL,
+         http_status               INT              NULL,
+         latency_ms                INT              NULL,
+         error_message             NVARCHAR(1000)   NULL,
+         triggered_at              DATETIMEOFFSET   NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+         CONSTRAINT PK_sequence_triggers PRIMARY KEY (id)
+       )`,
+      `IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_seq_triggers_phone')
+         CREATE INDEX IX_seq_triggers_phone ON sequence_triggers (phone)`,
+      `IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_seq_triggers_triggered')
+         CREATE INDEX IX_seq_triggers_triggered ON sequence_triggers (triggered_at DESC)`,
+    ];
+
+    for (const stmt of statements) {
+      try {
+        await pool.request().query(stmt);
+        results.push({ ok: true, stmt: stmt.trim().slice(0, 80) });
+      } catch (err) {
+        results.push({ ok: false, stmt: stmt.trim().slice(0, 80), error: err.message });
+      }
+    }
+
+    // Recreate vw_ping_master as a separate batch (requires GO in SSMS but here we just run it)
+    try {
+      await pool.request().query(`IF OBJECT_ID('vw_ping_master','V') IS NOT NULL DROP VIEW vw_ping_master`);
+      await pool.request().query(`
+        CREATE VIEW vw_ping_master AS
+        WITH mts_all AS (
+          SELECT id AS mts_id, ping_id, phone, zip, publisher_id, subid, campaign, vertical,
+                 rtb_status, bid_amount, buyer_id, routing_number, won, seq_state,
+                 requires_enrichment, enriched_at, created_at, expires_at FROM mts_auto
+          UNION ALL
+          SELECT id, ping_id, phone, zip, publisher_id, subid, campaign, vertical,
+                 rtb_status, bid_amount, buyer_id, routing_number, won, seq_state,
+                 requires_enrichment, enriched_at, created_at, expires_at FROM mts_health
+          UNION ALL
+          SELECT id, ping_id, phone, zip, publisher_id, subid, campaign, vertical,
+                 rtb_status, bid_amount, buyer_id, routing_number, won, seq_state,
+                 requires_enrichment, enriched_at, created_at, expires_at FROM mts_medicare
+          UNION ALL
+          SELECT id, ping_id, phone, zip, publisher_id, subid, campaign, vertical,
+                 rtb_status, bid_amount, buyer_id, routing_number, won, seq_state,
+                 requires_enrichment, enriched_at, created_at, expires_at FROM mts_home
+        )
+        SELECT
+          p.id AS ping_id, p.phone, p.zip, p.zip_source, p.publisher_id, p.subid,
+          p.campaign, p.ip, p.is_duplicate, p.raw_payload,
+          p.created_at AS ping_received_at,
+          rr.id AS ringba_response_id, rr.ringba_status, rr.ringba_status_code,
+          rr.bid_amount AS ringba_bid_amount, rr.buyer_id AS ringba_buyer_id,
+          rr.routing_number AS ringba_routing_number, rr.won AS ringba_won,
+          rr.response_time_ms AS ringba_response_ms, rr.outbound_payload,
+          rr.raw_response AS ringba_raw_response, rr.created_at AS ringba_responded_at,
+          mts.mts_id, mts.vertical, mts.seq_state, mts.requires_enrichment,
+          mts.enriched_at, mts.bid_amount AS mts_bid_amount,
+          mts.created_at AS mts_stored_at, mts.expires_at AS mts_expires_at,
+          seq_rtb.action AS seq_rtb_action, seq_rtb.was_enrichment_required,
+          seq_rtb.triggered_at AS seq_rtb_triggered_at,
+          seq_sms.action AS seq_sms_action, seq_sms.was_contacted_30d,
+          seq_sms.was_in_category, seq_sms.category_matched
+        FROM inbound_pings p
+        LEFT JOIN ringba_responses rr ON rr.ping_id = p.id
+        LEFT JOIN mts_all mts ON mts.ping_id = p.id
+        LEFT JOIN sequence_triggers seq_rtb
+          ON seq_rtb.ping_id = p.id AND seq_rtb.flow = 'rtb'
+        LEFT JOIN sequence_triggers seq_sms
+          ON seq_sms.ping_id = p.id AND seq_sms.flow = 'sms'
+      `);
+      results.push({ ok: true, stmt: 'CREATE VIEW vw_ping_master' });
+    } catch (err) {
+      results.push({ ok: false, stmt: 'CREATE VIEW vw_ping_master', error: err.message });
+    }
+
+    const allOk = results.every(r => r.ok);
+    return {
+      status: allOk ? 200 : 207,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ok: allOk, results }),
+    };
+  },
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Core aggregation runner
 // ─────────────────────────────────────────────────────────────────────────────
