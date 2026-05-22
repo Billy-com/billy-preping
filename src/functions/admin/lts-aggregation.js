@@ -35,10 +35,14 @@ app.http('ltsRunManual', {
     const authError = requireAdminKey(req);
     if (authError) return authError;
 
+    let body = {};
+    try { body = await req.json(); } catch {}
+    const days = body.days ? parseInt(body.days, 10) : null;
+
     const started = Date.now();
     let result;
     try {
-      result = await runAggregation(null);
+      result = await runAggregation(null, { days });
     } catch (err) {
       return {
         status: 500,
@@ -188,11 +192,108 @@ app.http('ltsMigrate', {
   },
 });
 
+// ── DB storage diagnostic — GET /mgmt/db/storage ─────────────────────────────
+app.http('dbStorage', {
+  methods: ['GET'],
+  route: 'mgmt/db/storage',
+  authLevel: 'anonymous',
+  handler: async (req) => {
+    const authError = requireAdminKey(req);
+    if (authError) return authError;
+
+    const pool = await getPool();
+
+    // DB size vs quota
+    const sizeRes = await pool.request().query(`
+      SELECT
+        (SELECT SUM(FILEPROPERTY(name,'SpaceUsed')/128.0) FROM sys.database_files WHERE type=0) AS used_mb,
+        (SELECT SUM(size/128.0) FROM sys.database_files WHERE type=0)                          AS allocated_mb,
+        (SELECT SUM(max_size/128.0) FROM sys.database_files WHERE type=0 AND max_size > 0)     AS max_mb
+    `);
+
+    // Top tables by row count and reserved KB
+    const tablesRes = await pool.request().query(`
+      SELECT TOP 20
+        t.name AS table_name,
+        p.rows,
+        SUM(a.total_pages) * 8 AS total_kb,
+        SUM(a.used_pages)  * 8 AS used_kb
+      FROM sys.tables t
+      INNER JOIN sys.indexes i ON t.object_id = i.object_id
+      INNER JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+      INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+      GROUP BY t.name, p.rows
+      ORDER BY total_kb DESC
+    `);
+
+    // Expired MTS rows available to purge
+    const expiredRes = await pool.request().query(`
+      SELECT
+        'mts_auto'     AS tbl, COUNT(*) AS expired_rows FROM mts_auto     WHERE expires_at < SYSDATETIMEOFFSET()
+      UNION ALL SELECT 'mts_health',   COUNT(*) FROM mts_health   WHERE expires_at < SYSDATETIMEOFFSET()
+      UNION ALL SELECT 'mts_medicare', COUNT(*) FROM mts_medicare WHERE expires_at < SYSDATETIMEOFFSET()
+      UNION ALL SELECT 'mts_home',     COUNT(*) FROM mts_home     WHERE expires_at < SYSDATETIMEOFFSET()
+    `);
+
+    return {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ok: true,
+        size: sizeRes.recordset[0],
+        tables: tablesRes.recordset,
+        expired_mts: expiredRes.recordset,
+      }),
+    };
+  },
+});
+
+// ── DB cleanup — POST /mgmt/db/cleanup ───────────────────────────────────────
+// Deletes expired MTS rows in batches (1000 rows at a time) to free quota.
+// Pass { tables: ["mts_auto","mts_health",...], batch_size: 1000 } or omit for all 4.
+app.http('dbCleanup', {
+  methods: ['POST'],
+  route: 'mgmt/db/cleanup',
+  authLevel: 'anonymous',
+  handler: async (req) => {
+    const authError = requireAdminKey(req);
+    if (authError) return authError;
+
+    let body = {};
+    try { body = await req.json(); } catch {}
+    const tables = body.tables || ['mts_auto', 'mts_health', 'mts_medicare', 'mts_home'];
+    const batchSize = body.batch_size || 1000;
+
+    const pool = await getPool();
+    const summary = {};
+
+    for (const tbl of tables) {
+      let total = 0;
+      // Loop in batches so we don't hold one giant transaction
+      let deleted = 1;
+      while (deleted > 0) {
+        const r = await pool.request()
+          .input('n', sql.Int, batchSize)
+          .query(`DELETE TOP(@n) FROM ${tbl} WHERE expires_at < SYSDATETIMEOFFSET()`);
+        deleted = r.rowsAffected[0];
+        total += deleted;
+      }
+      summary[tbl] = total;
+    }
+
+    return {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ok: true, deleted: summary }),
+    };
+  },
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Core aggregation runner
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function runAggregation(context) {
+async function runAggregation(context, opts = {}) {
   const log = (msg, ...args) => {
     if (context) context.log(msg, ...args);
     else console.log(msg, ...args);
@@ -212,7 +313,7 @@ async function runAggregation(context) {
   ]) {
     const t = Date.now();
     try {
-      const r = await fn(pool, log);
+      const r = await fn(pool, log, opts);
       results[name] = { ok: true, elapsed_ms: Date.now() - t, ...r };
       log(`[lts] ${name} done in ${Date.now() - t}ms`, r);
     } catch (err) {
@@ -229,7 +330,11 @@ async function runAggregation(context) {
 // Roll up per (stat_date, vertical, campaign) from inbound_pings + responses
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function aggregateDailyStats(pool, log) {
+async function aggregateDailyStats(pool, log, opts = {}) {
+  const dateFilter = opts.days
+    ? `AND p.created_at >= DATEADD(day, -${parseInt(opts.days, 10)}, SYSDATETIMEOFFSET())`
+    : '';
+
   // Compute aggregates from live tables — all history, idempotent via MERGE
   const srcResult = await pool.request().query(`
     SELECT
@@ -255,6 +360,7 @@ async function aggregateDailyStats(pool, log) {
       FROM contact_history
       WHERE contact_type = 'sms'
     ) ch ON ch.ping_id = p.id
+    WHERE 1=1 ${dateFilter}
     GROUP BY
       CONVERT(DATE, p.created_at),
       COALESCE(cat.vertical, 'unknown'),
@@ -328,7 +434,11 @@ async function aggregateDailyStats(pool, log) {
 // Lifetime stats per publisher_id × vertical with composite quality score
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function aggregatePublisherQuality(pool, log) {
+async function aggregatePublisherQuality(pool, log, opts = {}) {
+  const dateFilter = opts.days
+    ? `AND p.created_at >= DATEADD(day, -${parseInt(opts.days, 10)}, SYSDATETIMEOFFSET())`
+    : '';
+
   const srcResult = await pool.request().query(`
     SELECT
       p.publisher_id,
@@ -345,7 +455,7 @@ async function aggregatePublisherQuality(pool, log) {
     FROM inbound_pings p
     LEFT JOIN ringba_responses r   ON r.ping_id = p.id
     LEFT JOIN category_mappings cat ON cat.campaign = p.campaign AND cat.enabled = 1
-    WHERE p.publisher_id IS NOT NULL
+    WHERE p.publisher_id IS NOT NULL ${dateFilter}
     GROUP BY p.publisher_id, COALESCE(cat.vertical, 'unknown')
   `);
 
@@ -415,7 +525,11 @@ async function aggregatePublisherQuality(pool, log) {
 // One row per phone with latest state aggregated across all pings
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function aggregatePhoneProfile(pool, log) {
+async function aggregatePhoneProfile(pool, log, opts = {}) {
+  const dateFilter = opts.days
+    ? `WHERE p.created_at >= DATEADD(day, -${parseInt(opts.days, 10)}, SYSDATETIMEOFFSET())`
+    : '';
+
   // Get phone-level aggregate stats from pings + responses
   const srcResult = await pool.request().query(`
     SELECT
@@ -439,6 +553,7 @@ async function aggregatePhoneProfile(pool, log) {
       MAX(CASE WHEN r.bid_amount IS NOT NULL THEN r.created_at ELSE NULL END) AS last_bid_at
     FROM inbound_pings p
     LEFT JOIN ringba_responses r ON r.ping_id = p.id
+    ${dateFilter}
     GROUP BY p.phone
   `);
 
@@ -539,7 +654,11 @@ async function aggregatePhoneProfile(pool, log) {
 // Per-zip aggregate from inbound_pings + ringba_responses
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function aggregateGeoIntelligence(pool, log) {
+async function aggregateGeoIntelligence(pool, log, opts = {}) {
+  const dateFilter = opts.days
+    ? `AND p.created_at >= DATEADD(day, -${parseInt(opts.days, 10)}, SYSDATETIMEOFFSET())`
+    : '';
+
   const srcResult = await pool.request().query(`
     SELECT
       p.zip,
@@ -549,7 +668,7 @@ async function aggregateGeoIntelligence(pool, log) {
       AVG(CAST(r.bid_amount AS FLOAT))                              AS avg_bid_amount
     FROM inbound_pings p
     LEFT JOIN ringba_responses r ON r.ping_id = p.id
-    WHERE p.zip IS NOT NULL AND LEN(TRIM(p.zip)) > 0
+    WHERE p.zip IS NOT NULL AND LEN(TRIM(p.zip)) > 0 ${dateFilter}
     GROUP BY p.zip
   `);
 
@@ -593,7 +712,14 @@ async function aggregateGeoIntelligence(pool, log) {
 // Delta insert from postback_log + sequence_triggers (no full merge)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function aggregateOutcomeEvents(pool, log) {
+async function aggregateOutcomeEvents(pool, log, opts = {}) {
+  const dateFilter = opts.days
+    ? `AND pl.received_at >= DATEADD(day, -${parseInt(opts.days, 10)}, SYSDATETIMEOFFSET())`
+    : '';
+  const stDateFilter = opts.days
+    ? `AND st.triggered_at >= DATEADD(day, -${parseInt(opts.days, 10)}, SYSDATETIMEOFFSET())`
+    : '';
+
   // Check if postback_log exists before attempting to query it
   const pbCheck = await pool.request().query(`
     SELECT COUNT(1) AS cnt
@@ -626,7 +752,7 @@ async function aggregateOutcomeEvents(pool, log) {
         SELECT 1 FROM lt_outcome_events oe
         WHERE oe.source = 'postback'
           AND oe.raw_data = CAST(pl.id AS NVARCHAR(36))
-      )
+      ) ${dateFilter}
     `);
     postbackInserted = pbResult.rowsAffected[0] || 0;
   }
@@ -652,7 +778,7 @@ async function aggregateOutcomeEvents(pool, log) {
         SELECT 1 FROM lt_outcome_events oe
         WHERE oe.source = 'sequence_trigger'
           AND oe.raw_data = CAST(st.id AS NVARCHAR(36))
-      )
+      ) ${stDateFilter}
   `);
   const stInserted = stResult.rowsAffected[0] || 0;
 
@@ -666,7 +792,11 @@ async function aggregateOutcomeEvents(pool, log) {
 // tier: hot >=70, warm >=40, cold >=20, dormant <20
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function aggregateLeadScores(pool, log) {
+async function aggregateLeadScores(pool, log, opts = {}) {
+  const dateFilter = opts.days
+    ? `AND p.created_at >= DATEADD(day, -${parseInt(opts.days, 10)}, SYSDATETIMEOFFSET())`
+    : '';
+
   const srcResult = await pool.request().query(`
     SELECT
       p.phone,
@@ -678,6 +808,7 @@ async function aggregateLeadScores(pool, log) {
     FROM inbound_pings p
     LEFT JOIN ringba_responses r    ON r.ping_id  = p.id
     LEFT JOIN category_mappings cat ON cat.campaign = p.campaign AND cat.enabled = 1
+    WHERE 1=1 ${dateFilter}
     GROUP BY p.phone, COALESCE(cat.vertical, 'unknown')
   `);
 
