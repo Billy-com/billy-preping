@@ -16,8 +16,16 @@
 const { app } = require('@azure/functions');
 const { getPool, sql } = require('../../lib/db');
 const { getConfig } = require('../../lib/config-cache');
-const { requireAdminKey } = require('./middleware');
+const { requireAdminKey, corsHeaders } = require('./middleware');
 const { runSequencer } = require('../../lib/sequencer');
+
+// ── OPTIONS preflight ─────────────────────────────────────────────────────────
+app.http('mtsOptions', {
+  methods: ['OPTIONS'],
+  route: 'mgmt/mts/{*rest}',
+  authLevel: 'anonymous',
+  handler: async () => ({ status: 204, headers: corsHeaders(), body: '' }),
+});
 
 // ── GET /mgmt/mts ─────────────────────────────────────────────────────────────
 app.http('mtsListAll', {
@@ -57,7 +65,7 @@ app.http('mtsListAll', {
       OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
     `);
 
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result.recordset) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(result.recordset) };
   },
 });
 
@@ -75,7 +83,7 @@ app.http('mtsGetOne', {
       .query('SELECT * FROM vw_ping_master WHERE mts_id = @id');
 
     if (!result.recordset.length) return { status: 404, body: JSON.stringify({ error: 'not found' }) };
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result.recordset[0]) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(result.recordset[0]) };
   },
 });
 
@@ -109,7 +117,7 @@ app.http('mtsContactHistory', {
       OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
     `);
 
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result.recordset) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(result.recordset) };
   },
 });
 
@@ -125,7 +133,7 @@ app.http('mtsCategoriesList', {
     const result = await pool.request().query(
       'SELECT * FROM category_mappings ORDER BY campaign, category_key',
     );
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result.recordset) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(result.recordset) };
   },
 });
 
@@ -190,7 +198,7 @@ app.http('mtsPhoneCategoriesList', {
     const result = await request.query(
       `SELECT * FROM phone_categories ${where} ORDER BY created_at DESC`,
     );
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result.recordset) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(result.recordset) };
   },
 });
 
@@ -250,7 +258,7 @@ app.http('mtsPrune', {
       results[v] = r.rowsAffected[0];
     }
 
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pruned: results }) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify({ pruned: results }) };
   },
 });
 
@@ -288,7 +296,7 @@ app.http('mtsSequenceTriggers', {
       OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
     `);
 
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(result.recordset) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(result.recordset) };
   },
 });
 
@@ -412,7 +420,7 @@ app.http('mtsEvaluate', {
       },
     };
 
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(evaluation) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(evaluation) };
   },
 });
 
@@ -469,7 +477,7 @@ app.http('mtsTrigger', {
 
     return {
       status: triggered ? 200 : 500,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       body: JSON.stringify({ ok: triggered, mts_id: r.mts_id, force, error }),
     };
   },

@@ -12,14 +12,14 @@
  */
 const { app } = require('@azure/functions');
 const { getPool, sql } = require('../../lib/db');
-const { requireAdminKey } = require('./middleware');
+const { requireAdminKey, corsHeaders } = require('./middleware');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function json(body, status = 200) {
   return {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() },
     body: JSON.stringify(body),
   };
 }
@@ -34,6 +34,14 @@ function parseDateParam(val) {
   const d = new Date(val);
   return isNaN(d.getTime()) ? null : d;
 }
+
+// ── OPTIONS preflight for all LTS routes ─────────────────────────────────────
+app.http('ltsOptions', {
+  methods: ['OPTIONS'],
+  route: 'mgmt/lts/{*rest}',
+  authLevel: 'anonymous',
+  handler: async () => ({ status: 204, headers: corsHeaders(), body: '' }),
+});
 
 // ── GET /mgmt/lts/daily-stats ─────────────────────────────────────────────────
 app.http('ltsDailyStats', {

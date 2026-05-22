@@ -11,8 +11,22 @@
  */
 const { app }  = require('@azure/functions');
 const { getPool, sql } = require('../../lib/db');
-const { requireAdminKey } = require('./middleware');
+const { requireAdminKey, corsHeaders } = require('./middleware');
 const { invalidatePipelineCache } = require('../../lib/pipeline');
+
+// ── OPTIONS preflight ─────────────────────────────────────────────────────────
+app.http('pipelineOptions', {
+  methods: ['OPTIONS'],
+  route: 'mgmt/pipeline/{*rest}',
+  authLevel: 'anonymous',
+  handler: async () => ({ status: 204, headers: corsHeaders(), body: '' }),
+});
+app.http('dncOptions', {
+  methods: ['OPTIONS'],
+  route: 'mgmt/dnc/{*rest}',
+  authLevel: 'anonymous',
+  handler: async () => ({ status: 204, headers: corsHeaders(), body: '' }),
+});
 
 // ── GET /mgmt/pipeline/stages ─────────────────────────────────────────────────
 app.http('pipelineStagesList', {
@@ -27,7 +41,7 @@ app.http('pipelineStagesList', {
       FROM pipeline_stages ORDER BY macro_key, step_order
     `);
     const rows = r.recordset.map(s => ({ ...s, config: s.config ? JSON.parse(s.config) : null }));
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rows) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(rows) };
   },
 });
 
@@ -96,7 +110,7 @@ app.http('pipelinePostbackLog', {
       ORDER BY received_at DESC
       OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
     `);
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r.recordset) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(r.recordset) };
   },
 });
 
@@ -115,7 +129,7 @@ app.http('pipelinePostbackLogDetail', {
     const row = r.recordset[0];
     return {
       status: 200,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       body: JSON.stringify({ ...row, stage_results: row.stage_results ? JSON.parse(row.stage_results) : [] }),
     };
   },
@@ -141,7 +155,7 @@ app.http('dncList', {
         ORDER BY added_at DESC
         OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
       `);
-    return { status: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r.recordset) };
+    return { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders() }, body: JSON.stringify(r.recordset) };
   },
 });
 

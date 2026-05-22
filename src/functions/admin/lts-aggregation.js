@@ -14,7 +14,7 @@
  */
 const { app } = require('@azure/functions');
 const { getPool, sql } = require('../../lib/db');
-const { requireAdminKey } = require('./middleware');
+const { requireAdminKey, corsHeaders } = require('./middleware');
 
 // ── Timer trigger — 02:00 UTC every night ─────────────────────────────────────
 app.timer('ltsAggregationTimer', {
@@ -24,6 +24,14 @@ app.timer('ltsAggregationTimer', {
     const result = await runAggregation(context);
     context.log('[lts] Aggregation complete', result);
   },
+});
+
+// ── OPTIONS preflight for mgmt/db/* and mgmt/lts/run,migrate ─────────────────
+app.http('ltsAggOptions', {
+  methods: ['OPTIONS'],
+  route: 'mgmt/db/{*rest}',
+  authLevel: 'anonymous',
+  handler: async () => ({ status: 204, headers: corsHeaders(), body: '' }),
 });
 
 // ── Manual HTTP trigger — POST /mgmt/lts/run ──────────────────────────────────
@@ -46,14 +54,14 @@ app.http('ltsRunManual', {
     } catch (err) {
       return {
         status: 500,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
         body: JSON.stringify({ ok: false, error: err.message }),
       };
     }
 
     return {
       status: 200,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       body: JSON.stringify({ ok: true, elapsed_ms: Date.now() - started, ...result }),
     };
   },
@@ -113,7 +121,7 @@ app.http('dbTrim', {
 
     return {
       status: 200,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       body: JSON.stringify({ ok: true, keep_days: keepDays, nulled: summary }),
     };
   },
@@ -246,7 +254,7 @@ app.http('ltsMigrate', {
     const allOk = results.every(r => r.ok);
     return {
       status: allOk ? 200 : 207,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       body: JSON.stringify({ ok: allOk, results }),
     };
   },
@@ -297,7 +305,7 @@ app.http('dbStorage', {
 
     return {
       status: 200,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       body: JSON.stringify({
         ok: true,
         size: sizeRes.recordset[0],
@@ -343,7 +351,7 @@ app.http('dbCleanup', {
 
     return {
       status: 200,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       body: JSON.stringify({ ok: true, deleted: summary }),
     };
   },
