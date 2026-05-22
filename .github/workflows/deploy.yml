@@ -34,3 +34,26 @@ jobs:
           app-name: func-billy-prepng
           package: .
           publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+
+      # After every deploy, seed/refresh the last 7 days of LTS data.
+      # This ensures Strategy charts are never empty after a deployment.
+      # The LTS aggregation is idempotent (MERGE) so re-running is safe.
+      - name: Seed LTS aggregation (last 7 days)
+        run: |
+          sleep 15  # wait for functions to warm up after deploy
+          ADMIN_KEY="${{ secrets.ADMIN_API_KEY || 'Billy!Admin2026#' }}"
+          # Run schema migration first (idempotent — safe to re-run)
+          curl -sf -X POST "https://api.billy.com/rtb/mgmt/lts/migrate" \
+            -H "x-admin-key: $ADMIN_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            --max-time 60 \
+            --retry 2 || echo "migrate: non-fatal, continuing"
+          # Seed last 7 days of aggregations
+          curl -sf -X POST "https://api.billy.com/rtb/mgmt/lts/run" \
+            -H "x-admin-key: $ADMIN_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"days":7}' \
+            --max-time 300 \
+            --retry 1 || echo "lts/run: non-fatal, continuing"
+        continue-on-error: true
