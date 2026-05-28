@@ -4,7 +4,7 @@ const { getPool, sql } = require('../lib/db');
 const { normalizePhone, normalizeZip } = require('../lib/normalize');
 const { forwardToRingba } = require('../lib/ringba');
 const { fanout } = require('../lib/fanout');
-const { getConfig } = require('../lib/config-cache');
+const { getConfig, isPublisherEnabled } = require('../lib/config-cache');
 const { writeMidTermStorage } = require('../lib/mts');
 
 // Pre-warm DB pool and config cache on module load so the first real ping
@@ -39,6 +39,16 @@ app.http('pingByRtbId', {
     const subid        = body.subid ?? body.source ?? null;
     const campaign     = body.campaign ?? rtbId;
     const ip           = body.ip ?? null;
+
+    // Publisher enabled gate — checked against Azure SQL cache (60s TTL).
+    // Return a no-bid 200 so publishers don't flag the integration as broken.
+    if (!(await isPublisherEnabled(publisher_id))) {
+      return {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ won: false, bid: 0, reason: 'publisher_disabled' }),
+      };
+    }
 
     if (!rawPhone) {
       return { status: 400, body: JSON.stringify({ error: 'phone or CID is required' }) };
@@ -120,6 +130,15 @@ app.http('ping', {
     const subid        = body.subid ?? body.source ?? null;
     const campaign     = body.campaign ?? null;
     const ip           = body.ip ?? null;
+
+    // Publisher enabled gate — same 60s-cached check as the rtbId handler
+    if (!(await isPublisherEnabled(publisher_id))) {
+      return {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ won: false, bid: 0, reason: 'publisher_disabled' }),
+      };
+    }
 
     // Only phone/CID is required — all other field requirements are enforced at the UI level
     if (!rawPhone) {
