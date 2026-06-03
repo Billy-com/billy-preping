@@ -1,4 +1,4 @@
-const ENRICH_TIMEOUT_MS = 10;
+const ENRICH_TIMEOUT_MS = 1500; // 1.5s — sufficient for ip-api.com, well within fanout budget
 
 /**
  * Look up zip code from caller IP via ip-api.com.
