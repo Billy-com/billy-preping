@@ -31,6 +31,7 @@ const VALID_VERTICALS = new Set(['auto', 'health', 'medicare', 'home']);
 async function writeMidTermStorage({
   pingId, phone, zip, publisher_id, subid, campaign,
   ringbaStatus, bidAmount, buyerId, routingNumber, won,
+  ffgSpineId = null, ffgLineType = null,
 }) {
   const enabled = await getConfig('mts_enabled');
   if (enabled !== '1') return;
@@ -74,6 +75,7 @@ async function writeMidTermStorage({
   runSequencer({
     mtsId, pingId, phone, vertical, campaign,
     rtbStatus: ringbaStatus, bidAmount,
+    ffgSpineId, ffgLineType,
   }).catch((err) => console.error('[mts] sequencer error:', err.message));
 }
 

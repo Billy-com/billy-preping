@@ -14,15 +14,36 @@
  */
 const { getPool, sql } = require('./db');
 const { getConfig } = require('./config-cache');
+const { lookupPhone } = require('./ffg');
 const { v4: uuidv4 } = require('uuid');
 
-async function runSequencer({ mtsId, pingId, phone, vertical, campaign, rtbStatus, bidAmount }) {
+async function runSequencer({ mtsId, pingId, phone, vertical, campaign, rtbStatus, bidAmount, ffgSpineId, ffgLineType }) {
   const enabled = await getConfig('sequencer_enabled');
   if (enabled !== '1') return;
 
   const pool = await getPool();
 
-  // ── RTB FLOW ──────────────────────────────────────────────────────────────
+  // ── RTB FLOW / TOP OF FUNNEL ──────────────────────────────────────────────
+  // Step 3: FFG identity enrichment (if not already done in ping.js).
+  // In the hot path, FFG runs in ping.js before Ringba. Here in the sequencer
+  // (fire-and-forget), we call FFG if we don't already have spine data so that
+  // demographic signals are available for SMS routing decisions.
+  let demographic = null;
+  let spineId = ffgSpineId ?? null;
+  const ffgEnabled = await getConfig('ffg_enabled');
+  if (ffgEnabled === '1' && !spineId) {
+    const customerId = await getConfig('ffg_customer_id');
+    const apiKey     = await getConfig('ffg_api_key');
+    const sandbox    = (await getConfig('ffg_sandbox')) === '1';
+    if (customerId && apiKey) {
+      const ffgResult = await lookupPhone({ phone, customerId, apiKey, sandbox }).catch(() => null);
+      if (ffgResult) {
+        spineId     = ffgResult.spineId;
+        demographic = ffgResult.demographic;
+      }
+    }
+  }
+
   const requiresEnrichment = await checkRequiresEnrichment(pool, phone);
   const rtbAction   = requiresEnrichment ? 'top_of_funnel' : 'ringba_direct';
   const nextState   = requiresEnrichment ? 'enrichment_needed' : 'ringba_direct';
