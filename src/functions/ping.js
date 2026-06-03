@@ -6,6 +6,8 @@ const { forwardToRingba } = require('../lib/ringba');
 const { fanout } = require('../lib/fanout');
 const { getConfig, isPublisherEnabled } = require('../lib/config-cache');
 const { writeMidTermStorage } = require('../lib/mts');
+const { publishEvent } = require('../lib/event-hub');
+const { lookupPhone } = require('../lib/ffg');
 
 // Pre-warm DB pool and config cache on module load so the first real ping
 // doesn't pay the connection + cache-miss cost on the critical path.
@@ -61,8 +63,40 @@ app.http('pingByRtbId', {
 
     const zip        = normalizeZip(rawZip);
     const zipSource  = zip ? 'publisher' : null;
-    const preRingba  = Date.now();
 
+    // ── Step 3: FFG identity enrichment (gate before Ringba bid) ─────────────
+    // Checks phone line type. Landlines/VoIP are rejected here to save bid
+    // budget. Fail-open: any FFG error lets the ping continue to Ringba.
+    let ffgSpineId    = null;
+    let ffgLineType   = null;
+    let ffgDemographic = null;
+    const ffgEnabled  = await getConfig('ffg_enabled');
+    if (ffgEnabled === '1') {
+      const ffgCustomerId = await getConfig('ffg_customer_id');
+      const ffgApiKey     = await getConfig('ffg_api_key');
+      const ffgSandbox    = (await getConfig('ffg_sandbox')) === '1';
+      const ffgTimeout    = Number(await getConfig('ffg_timeout_ms') ?? '2000') || 2000;
+
+      const ffgResult = await lookupPhone({
+        phone, customerId: ffgCustomerId, apiKey: ffgApiKey,
+        sandbox: ffgSandbox, timeoutMs: ffgTimeout,
+      });
+
+      ffgSpineId    = ffgResult.spineId;
+      ffgLineType   = ffgResult.lineType;
+      ffgDemographic = ffgResult.demographic;
+
+      if (!ffgResult.pass) {
+        // Rejected (landline/VoIP) — return no-bid without touching Ringba
+        return {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'x-ffg-rejected': '1', 'x-ffg-reason': ffgResult.reason },
+          body: JSON.stringify({ won: false, bid: 0, reason: ffgResult.reason, ffg: { line_type: ffgResult.lineType } }),
+        };
+      }
+    }
+
+    const preRingba  = Date.now();
     const pingPayload = { phone, zip, publisher_id, subid, campaign, ip };
     const { status: ringbaStatus, statusCode, outboundPayload, response: ringbaResponse, responseTimeMs } =
       await forwardToRingba(pingPayload, rtbUrl);
@@ -71,14 +105,26 @@ app.http('pingByRtbId', {
     const overheadMs = totalMs - (responseTimeMs ?? 0); // our cost excluding Ringba
 
     const pingId = uuidv4();
-    const won    = ringbaResponse?.won ?? false;
+    // won starts false — flipped to true only when Ringba fires the postback
+    // (Ringba v1 RTB responses never include a 'won' field)
+    const won    = false;
     const responseBody = ringbaResponse ? JSON.stringify(ringbaResponse) : '{}';
 
     // All DB work is fire-and-forget — response returns immediately after Ringba
     writePingToDb({
       pingId, phone, zip, zipSource, publisher_id, subid, campaign, ip,
       rawPayload: body, ringbaResponse, ringbaStatus, statusCode, outboundPayload, responseTimeMs, won,
+      ffgSpineId, ffgLineType,
     }).catch((err) => console.error('[ping/rtbId] db write failed:', err.message));
+
+    // Event Hub publish — durability layer; errors never block the response
+    publishEvent('ping.received', {
+      pingId, phone, zip, publisher_id, subid, campaign, ip,
+      ringbaStatus, won, responseTimeMs,
+      bidAmount:     ringbaResponse?.bidAmount ?? ringbaResponse?.bid_amount ?? null,
+      buyerId:       ringbaResponse?.buyerId   ?? ringbaResponse?.buyer_id   ?? null,
+      routingNumber: ringbaResponse?.phoneNumber ?? ringbaResponse?.phoneNumberNoPlus ?? null,
+    }).catch(() => {});
 
     writeMidTermStorage({
       pingId, phone, zip, publisher_id, subid, campaign,
@@ -153,6 +199,35 @@ app.http('ping', {
     const zip       = normalizeZip(rawZip);
     const zipSource = zip ? 'publisher' : null;
 
+    // ── Step 3: FFG identity enrichment ──────────────────────────────────────
+    let ffgSpineId    = null;
+    let ffgLineType   = null;
+    let ffgDemographic = null;
+    const ffgEnabled  = await getConfig('ffg_enabled');
+    if (ffgEnabled === '1') {
+      const ffgCustomerId = await getConfig('ffg_customer_id');
+      const ffgApiKey     = await getConfig('ffg_api_key');
+      const ffgSandbox    = (await getConfig('ffg_sandbox')) === '1';
+      const ffgTimeout    = Number(await getConfig('ffg_timeout_ms') ?? '2000') || 2000;
+
+      const ffgResult = await lookupPhone({
+        phone, customerId: ffgCustomerId, apiKey: ffgApiKey,
+        sandbox: ffgSandbox, timeoutMs: ffgTimeout,
+      });
+
+      ffgSpineId    = ffgResult.spineId;
+      ffgLineType   = ffgResult.lineType;
+      ffgDemographic = ffgResult.demographic;
+
+      if (!ffgResult.pass) {
+        return {
+          status: 200,
+          headers: { 'Content-Type': 'application/json', 'x-ffg-rejected': '1', 'x-ffg-reason': ffgResult.reason },
+          body: JSON.stringify({ won: false, bid: 0, reason: ffgResult.reason, ffg: { line_type: ffgResult.lineType } }),
+        };
+      }
+    }
+
     // getConfig is served from in-memory cache after first call — no DB hit on hot path
     const rtbUrl      = await getConfig('ringba_rtb_url');
     const pingPayload = { phone, zip, publisher_id, subid, campaign, ip };
@@ -163,7 +238,9 @@ app.http('ping', {
     const overheadMs = totalMs - (responseTimeMs ?? 0);
 
     const pingId = uuidv4();
-    const won    = ringbaResponse?.won ?? false;
+    // won starts false — flipped to true only when Ringba fires the postback
+    // (Ringba v1 RTB responses never include a 'won' field)
+    const won    = false;
     const responseBody = ringbaResponse ? JSON.stringify(ringbaResponse) : '{}';
 
     // All DB work is fire-and-forget — response returns immediately after Ringba
@@ -171,6 +248,15 @@ app.http('ping', {
       pingId, phone, zip, zipSource, publisher_id, subid, campaign, ip,
       rawPayload: body, ringbaResponse, ringbaStatus, statusCode, outboundPayload, responseTimeMs, won,
     }).catch((err) => console.error('[ping] db write failed:', err.message));
+
+    // Event Hub publish — durability layer; errors never block the response
+    publishEvent('ping.received', {
+      pingId, phone, zip, publisher_id, subid, campaign, ip,
+      ringbaStatus, won, responseTimeMs,
+      bidAmount:     ringbaResponse?.bidAmount ?? ringbaResponse?.bid_amount ?? null,
+      buyerId:       ringbaResponse?.buyerId   ?? ringbaResponse?.buyer_id   ?? null,
+      routingNumber: ringbaResponse?.phoneNumber ?? ringbaResponse?.phoneNumberNoPlus ?? null,
+    }).catch(() => {});
 
     writeMidTermStorage({
       pingId, phone, zip, publisher_id, subid, campaign,
