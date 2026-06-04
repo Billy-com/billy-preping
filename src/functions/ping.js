@@ -70,6 +70,7 @@ app.http('pingByRtbId', {
     let ffgSpineId    = null;
     let ffgLineType   = null;
     let ffgDemographic = null;
+    let ffgPass       = null;   // null = FFG disabled; true = passed; false = rejected
     const ffgEnabled  = await getConfig('ffg_enabled');
     if (ffgEnabled === '1') {
       const ffgCustomerId = await getConfig('ffg_customer_id');
@@ -85,6 +86,7 @@ app.http('pingByRtbId', {
       ffgSpineId    = ffgResult.spineId;
       ffgLineType   = ffgResult.lineType;
       ffgDemographic = ffgResult.demographic;
+      ffgPass       = !!ffgResult.pass;
 
       if (!ffgResult.pass) {
         // Rejected (landline/VoIP) — return no-bid without touching Ringba
@@ -114,7 +116,7 @@ app.http('pingByRtbId', {
     writePingToDb({
       pingId, phone, zip, zipSource, publisher_id, subid, campaign, ip,
       rawPayload: body, ringbaResponse, ringbaStatus, statusCode, outboundPayload, responseTimeMs, won,
-      ffgSpineId, ffgLineType,
+      ffgSpineId, ffgLineType, ffgPass, ffgDemographic,
     }).catch((err) => console.error('[ping/rtbId] db write failed:', err.message));
 
     // Event Hub publish — durability layer; errors never block the response
@@ -203,6 +205,7 @@ app.http('ping', {
     let ffgSpineId    = null;
     let ffgLineType   = null;
     let ffgDemographic = null;
+    let ffgPass       = null;   // null = FFG disabled; true = passed; false = rejected
     const ffgEnabled  = await getConfig('ffg_enabled');
     if (ffgEnabled === '1') {
       const ffgCustomerId = await getConfig('ffg_customer_id');
@@ -218,6 +221,7 @@ app.http('ping', {
       ffgSpineId    = ffgResult.spineId;
       ffgLineType   = ffgResult.lineType;
       ffgDemographic = ffgResult.demographic;
+      ffgPass       = !!ffgResult.pass;
 
       if (!ffgResult.pass) {
         return {
@@ -247,6 +251,7 @@ app.http('ping', {
     writePingToDb({
       pingId, phone, zip, zipSource, publisher_id, subid, campaign, ip,
       rawPayload: body, ringbaResponse, ringbaStatus, statusCode, outboundPayload, responseTimeMs, won,
+      ffgSpineId, ffgLineType, ffgPass, ffgDemographic,
     }).catch((err) => console.error('[ping] db write failed:', err.message));
 
     // Event Hub publish — durability layer; errors never block the response
@@ -287,25 +292,32 @@ app.http('ping', {
 async function writePingToDb({
   pingId, phone, zip, zipSource, publisher_id, subid, campaign, ip,
   rawPayload, ringbaResponse, ringbaStatus, statusCode, outboundPayload, responseTimeMs, won,
+  ffgSpineId = null, ffgLineType = null, ffgPass = null, ffgDemographic = null,
 }) {
   const pool = await getPool();
 
   await pool.request()
-    .input('id',           sql.UniqueIdentifier,  pingId)
-    .input('phone',        sql.NVarChar(20),       phone)
-    .input('zip',          sql.NVarChar(10),       zip ?? null)
-    .input('zip_source',   sql.NVarChar(20),       zipSource ?? null)
-    .input('publisher_id', sql.NVarChar(255),      publisher_id)
-    .input('subid',        sql.NVarChar(255),      subid ?? null)
-    .input('campaign',     sql.NVarChar(255),      campaign)
-    .input('ip',           sql.NVarChar(50),       ip ?? null)
-    .input('is_duplicate', sql.Bit,                0)
-    .input('raw_payload',  sql.NVarChar(sql.MAX),  JSON.stringify(rawPayload))
+    .input('id',              sql.UniqueIdentifier,  pingId)
+    .input('phone',           sql.NVarChar(20),       phone)
+    .input('zip',             sql.NVarChar(10),       zip ?? null)
+    .input('zip_source',      sql.NVarChar(20),       zipSource ?? null)
+    .input('publisher_id',    sql.NVarChar(255),      publisher_id)
+    .input('subid',           sql.NVarChar(255),      subid ?? null)
+    .input('campaign',        sql.NVarChar(255),      campaign)
+    .input('ip',              sql.NVarChar(50),       ip ?? null)
+    .input('is_duplicate',    sql.Bit,                0)
+    .input('raw_payload',     sql.NVarChar(sql.MAX),  JSON.stringify(rawPayload))
+    .input('ffg_spine_id',    sql.NVarChar(255),      ffgSpineId ?? null)
+    .input('ffg_line_type',   sql.NVarChar(20),       ffgLineType ?? null)
+    .input('ffg_pass',        sql.Bit,                ffgPass != null ? (ffgPass ? 1 : 0) : null)
+    .input('ffg_demographic', sql.NVarChar(sql.MAX),  ffgDemographic ? JSON.stringify(ffgDemographic) : null)
     .query(`
       INSERT INTO inbound_pings
-        (id, phone, zip, zip_source, publisher_id, subid, campaign, ip, is_duplicate, raw_payload)
+        (id, phone, zip, zip_source, publisher_id, subid, campaign, ip, is_duplicate, raw_payload,
+         ffg_spine_id, ffg_line_type, ffg_pass, ffg_demographic)
       VALUES
-        (@id, @phone, @zip, @zip_source, @publisher_id, @subid, @campaign, @ip, @is_duplicate, @raw_payload)
+        (@id, @phone, @zip, @zip_source, @publisher_id, @subid, @campaign, @ip, @is_duplicate, @raw_payload,
+         @ffg_spine_id, @ffg_line_type, @ffg_pass, @ffg_demographic)
     `);
 
   // Always write ringba_responses — captures full OUT journey for every ping
