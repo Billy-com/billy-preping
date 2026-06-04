@@ -39,7 +39,7 @@ app.http('adminRtbMappingsList', {
         COUNT(p.id)                  AS total_pings,
         MAX(p.created_at)            AS last_seen_at
       FROM publisher_rtb_mappings m
-      LEFT JOIN inbound_pings p ON p.publisher_id = m.publisher_id
+      LEFT JOIN inbound_pings p ON p.campaign = m.rtb_id
       ${where}
       GROUP BY m.publisher_id, m.publisher_name, m.rtb_id, m.campaign, m.campaign_id,
                m.enabled, m.synced_at, m.last_ping_at, m.created_at
@@ -87,19 +87,23 @@ app.http('adminRtbMappingsSync', {
 
     for (const m of mappings) {
       if (!m.publisher_id || !m.rtb_id) continue;
+      // IMPORTANT: Merge on rtb_id (unique per publisher×campaign), NOT publisher_id.
+      // Using publisher_id as the key means every sync of the same publisher overwrites
+      // all previous rows — leaving only the last entry. Each publisher can have many
+      // campaigns, each with its own RTB ID.
       await pool.request()
         .input('publisher_id',   sql.NVarChar(255), m.publisher_id)
         .input('publisher_name', sql.NVarChar(255), m.publisher_name ?? null)
         .input('rtb_id',         sql.NVarChar(255), m.rtb_id)
-        .input('campaign',       sql.NVarChar(255), m.campaign ?? null)
+        .input('campaign',       sql.NVarChar(255), m.campaign ?? m.campaign_name ?? null)
         .input('campaign_id',    sql.NVarChar(255), m.campaign_id ?? null)
         .input('enabled',        sql.Bit,           m.enabled !== false ? 1 : 0)
         .query(`
           MERGE publisher_rtb_mappings AS target
-          USING (SELECT @publisher_id AS publisher_id) AS src ON target.publisher_id = src.publisher_id
+          USING (SELECT @rtb_id AS rtb_id) AS src ON target.rtb_id = src.rtb_id
           WHEN MATCHED THEN UPDATE SET
+            publisher_id   = @publisher_id,
             publisher_name = @publisher_name,
-            rtb_id         = @rtb_id,
             campaign       = @campaign,
             campaign_id    = @campaign_id,
             enabled        = @enabled,
